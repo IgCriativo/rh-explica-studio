@@ -7,6 +7,7 @@ from pathlib import Path
 import streamlit as st
 import requests
 from dotenv import dotenv_values
+from PIL import Image, ImageDraw, ImageFont
 import gradium.client
 
 # ==============================================================================
@@ -33,9 +34,12 @@ VOZES_DIR = BASE_DIR / "PERSONAGENS" / "VOZES CLONADAS"
 NARRATION_DIR = BASE_DIR / "NARRAÇÕES"
 VIDEOS_GERADOS_DIR = BASE_DIR / "VIDEOS GERADOS"
 LOGO_FILE = BASE_DIR / "LOGO PARA USO.png"
+ENCERRAMENTO_FILE = BASE_DIR / "ENCERRAMENTO PADRÃO.mp4"
+TEMP_DIR = BASE_DIR / ".temp"
 
 NARRATION_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_GERADOS_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Suporte transparente a st.secrets (Streamlit Cloud) e .env (Local)
 env_cfg = {}
@@ -48,8 +52,6 @@ except Exception:
 env_cfg.update(dotenv_values(BASE_DIR / ".env"))
 
 GRADIUM_KEY = env_cfg.get("GRADIUM_API_KEY", "")
-OPENROUTER_KEY = env_cfg.get("API_KEY_OPENROUTER", "")
-OPENROUTER_MODEL = env_cfg.get("MODEL_USE", "fish-audio/s2.1-pro-free:free")
 
 VOZES_MAP = {
     "ANA RH": {"id": env_cfg.get("ANA", "9mWFpgPdQZOr90Ys"), "genero": "f", "pasta": "ANA"},
@@ -61,7 +63,7 @@ VOZES_MAP = {
 }
 
 # ==============================================================================
-# HIGIENIZAÇÃO DE TEXTO
+# HIGIENIZAÇÃO DE TEXTO E UTILITÁRIOS
 # ==============================================================================
 def sanitizar_nome_arquivo(nome: str) -> str:
     limpo = re.sub(r'[\\/*?:"<>|]', '', nome)
@@ -101,6 +103,14 @@ def analisar_roteiro_em_temas(texto_bruto: str):
             })
     return temas
 
+def obter_duracao_midia(caminho: Path) -> float:
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(caminho)]
+    try:
+        res = subprocess.check_output(cmd, text=True).strip()
+        return float(res)
+    except Exception:
+        return 0.0
+
 # ==============================================================================
 # SÍNTESE DE ÁUDIO
 # ==============================================================================
@@ -123,27 +133,148 @@ async def sintetizar_edge_tts(texto: str, genero: str, destino: Path) -> Path:
     return destino_mp3
 
 # ==============================================================================
-# COMPOSIÇÃO DE VÍDEO (FFMPEG - 1 TEMA = 1 CENA EM LOOP 16:9 WIDESCREEN)
+# CARD H1 (DESIGN VISUAL COM PILLOW PARA 16:9 WIDESCREEN)
 # ==============================================================================
-def renderizar_video_tema(caminho_video_base: Path, caminho_audio: Path, destino_mp4: Path, logo_path: Path) -> bool:
-    # 16:9 Widescreen (1920x1080) nativo dos takes Veo 3
+def gerar_card_h1(titulo: str, destino_png: Path, largura: int = 1920, altura: int = 1080) -> Path:
+    img = Image.new('RGBA', (largura, altura), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # Fontes com fallback
+    font_badge = None
+    font_titulo = None
+    for fonte in ["segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"]:
+        try:
+            font_badge = ImageFont.truetype(fonte, 20)
+            font_titulo = ImageFont.truetype(fonte, 38)
+            break
+        except Exception:
+            pass
+    if font_badge is None:
+        font_badge = ImageFont.load_default()
+        font_titulo = ImageFont.load_default()
+
+    texto = titulo.strip()
+    badge_texto = "RH EXPLICA"
+
+    bbox_badge = draw.textbbox((0, 0), badge_texto, font=font_badge)
+    bbox_tit = draw.textbbox((0, 0), texto, font=font_titulo)
+    
+    w_conteudo = max(bbox_badge[2] - bbox_badge[0], bbox_tit[2] - bbox_tit[0])
+    h_conteudo = (bbox_badge[3] - bbox_badge[1]) + (bbox_tit[3] - bbox_tit[1]) + 18
+
+    pad_x, pad_y = 36, 22
+    box_w = min(w_conteudo + (pad_x * 2), largura - 160)
+    box_h = h_conteudo + (pad_y * 2)
+
+    box_x = 80
+    box_y = 60
+
+    # Container escuro fosco translúcido com borda suave
+    draw.rounded_rectangle(
+        [box_x, box_y, box_x + box_w, box_y + box_h],
+        radius=14,
+        fill=(15, 23, 42, 215),
+        outline=(255, 255, 255, 45),
+        width=2
+    )
+
+    # Tag / Badge
+    draw.text((box_x + pad_x, box_y + pad_y), badge_texto, fill=(56, 189, 248, 255), font=font_badge)
+    # Título H1
+    draw.text((box_x + pad_x, box_y + pad_y + (bbox_badge[3] - bbox_badge[1]) + 10), texto, fill=(255, 255, 255, 255), font=font_titulo)
+
+    destino_png.parent.mkdir(parents=True, exist_ok=True)
+    img.save(destino_png, "PNG")
+    return destino_png
+
+# ==============================================================================
+# COMPOSIÇÃO DE VÍDEO (FFMPEG - 16:9 WIDESCREEN + H1 + ENCERRAMENTO PADRÃO)
+# ==============================================================================
+def renderizar_video_tema(
+    caminho_video_base: Path,
+    caminho_audio: Path,
+    destino_mp4: Path,
+    logo_path: Path,
+    titulo_h1: str = "",
+    incluir_encerramento: bool = True
+) -> bool:
+    audio_dur = obter_duracao_midia(caminho_audio)
+    if audio_dur <= 0:
+        return False
+
+    temp_card = TEMP_DIR / f"card_{sanitizar_nome_arquivo(titulo_h1 or 'h1')}.png"
+    usar_h1 = bool(titulo_h1.strip())
+    if usar_h1:
+        gerar_card_h1(titulo_h1.strip(), temp_card)
+
+    has_encerramento = incluir_encerramento and ENCERRAMENTO_FILE.exists()
+
+    input_args = []
+    
+    # 0: Vídeo base em loop contínuo
+    input_args.extend(['-stream_loop', '-1', '-i', str(caminho_video_base)])
+    
+    # 1: Áudio narrado oficial
+    input_args.extend(['-i', str(caminho_audio)])
+    
+    # 2: Logo oficial
+    input_args.extend(['-i', str(logo_path)])
+    
+    next_idx = 3
+    idx_card = None
+    if usar_h1:
+        input_args.extend(['-i', str(temp_card)])
+        idx_card = next_idx
+        next_idx += 1
+
+    idx_enc = None
+    idx_sil = None
+    if has_encerramento:
+        input_args.extend(['-i', str(ENCERRAMENTO_FILE)])
+        idx_enc = next_idx
+        next_idx += 1
+        input_args.extend(['-f', 'lavfi', '-t', '16', '-i', 'anullsrc=r=44100:cl=stereo'])
+        idx_sil = next_idx
+        next_idx += 1
+
+    filter_chains = [
+        f'[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p,fps=30,trim=duration={audio_dur}[vbase]',
+        '[2:v]scale=200:-1[lg]',
+        '[vbase][lg]overlay=W-w-60:50[vlogo]'
+    ]
+
+    curr_v = 'vlogo'
+    if usar_h1 and idx_card is not None:
+        filter_chains.append(f'[{idx_card}:v]fade=t=in:st=0:d=0.5:alpha=1,fade=t=out:st=6.5:d=0.8:alpha=1[h1card]')
+        filter_chains.append(f'[{curr_v}][h1card]overlay=0:0[vwithh1]')
+        curr_v = 'vwithh1'
+
+    filter_chains.append(f'[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,atrim=duration={audio_dur}[ap1]')
+
+    if has_encerramento and idx_enc is not None and idx_sil is not None:
+        filter_chains.extend([
+            f'[{idx_enc}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p,fps=30[venc]',
+            f'[{idx_sil}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aenc]',
+            f'[{curr_v}][ap1][venc][aenc]concat=n=2:v=1:a=1[outv][outa]'
+        ])
+        map_v, map_a = '[outv]', '[outa]'
+    else:
+        map_v, map_a = f'[{curr_v}]', '[ap1]'
+
     cmd = [
         'ffmpeg', '-y',
-        '-stream_loop', '-1', '-i', str(caminho_video_base),
-        '-i', str(caminho_audio),
-        '-i', str(logo_path),
-        '-filter_complex',
-        '[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p[vid];'
-        '[2:v]scale=200:-1[lg];'
-        '[vid][lg]overlay=W-w-60:50[outv]',
-        '-map', '[outv]',
-        '-map', '1:a',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        *input_args,
+        '-filter_complex', ';'.join(filter_chains),
+        '-map', map_v,
+        '-map', map_a,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
         '-c:a', 'aac', '-b:a', '192k',
-        '-shortest',
         str(destino_mp4)
     ]
+
     res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if res.returncode != 0:
+        print("FFMPEG ERROR:\n", res.stderr[-500:])
     return res.returncode == 0
 
 # ==============================================================================
@@ -257,32 +388,44 @@ with tab_audio:
 # ABA 2: COMPOSITOR DE VÍDEOS AUTOMÁTICO (16:9 WIDESCREEN)
 # ------------------------------------------------------------------------------
 with tab_video:
-    st.subheader("Montagem Automatizada de Vídeos 16:9 (1920x1080)")
-    st.caption("Aplica 1 cena exclusiva em loop contínuo widescreen, preservando 100% do cenário do Veo 3 sem cortes, com o logo e áudio perfeitamente integrados.")
+    st.subheader("Montagem Automatizada de Vídeos 16:9 (1920x1080 Full HD)")
+    st.caption("Aplica 1 cena exclusiva em loop contínuo widescreen ou vídeo sincronizado do DreamFace, insere o Title Card H1 com fade-out, logo oficial e anexa o Encerramento Padrão automaticamente.")
     
     col_v1, col_v2 = st.columns([1, 2], gap="large")
     
     with col_v1:
-        st.markdown("### 1. Parâmetros do Vídeo")
-        pers_video = st.selectbox("Personagem para o Vídeo:", list(VOZES_MAP.keys()), index=0, key="sel_video_pers")
+        st.markdown("### 1. Personagem e Vídeo Base")
+        pers_video = st.selectbox("Personagem:", list(VOZES_MAP.keys()), index=0, key="sel_video_pers")
         pasta_pers = BASE_DIR / "PERSONAGENS" / VOZES_MAP[pers_video]["pasta"]
         
-        videos_cena = sorted(list(pasta_pers.glob("*HRZ*.mp4")) + list(pasta_pers.glob("*VIDEO*.mp4")))
+        # Encontrar vídeos base (Veo 3 original ou já sincronizados no DreamFace)
+        videos_cena = sorted(
+            list(pasta_pers.glob("*HRZ*.mp4")) + 
+            list(pasta_pers.glob("*VIDEO*.mp4")) +
+            list(pasta_pers.glob("*DREAMFACE*.mp4")) +
+            list(pasta_pers.glob("*LIP*.mp4"))
+        )
+        
         if not videos_cena:
             st.error(f"Nenhum vídeo HRZ encontrado na pasta {pasta_pers}")
             cena_escolhida = None
         else:
             rotulos_cena = [v.name for v in videos_cena]
-            idx_cena = st.selectbox("Cena Exclusiva (1 Tema = 1 Cena):", range(len(rotulos_cena)), format_func=lambda x: rotulos_cena[x])
+            idx_cena = st.selectbox("Vídeo Base (1 Tema = 1 Cena):", range(len(rotulos_cena)), format_func=lambda x: rotulos_cena[x])
             cena_escolhida = videos_cena[idx_cena]
-            st.caption(f"Arquivo selecionado: `{cena_escolhida.name}`")
+            st.caption(f"Cena ativa: `{cena_escolhida.name}`")
             
         st.markdown("---")
-        st.markdown("### 2. Formato e Identidade")
-        st.success("📐 Formato Padrão: **16:9 Widescreen (1920x1080 Full HD)**")
-        st.checkbox("Aplicar Logo Oficial", value=True, disabled=True)
-        st.caption(f"Logo ativo: `{LOGO_FILE.name}`")
-        st.info("💡 Slots para Boxname e Encerramento Padrão preservados.")
+        st.markdown("### 2. Recursos de Acabamento")
+        st.success("📐 Resolução: **1920x1080 (16:9 Full HD)**")
+        
+        chk_h1 = st.checkbox("🏷️ Inserir Card H1 do Tema (Fade-out aos 7s)", value=True, key="chk_h1")
+        chk_encerramento = st.checkbox("🎬 Anexar Encerramento Padrão (16s)", value=True, key="chk_encerramento")
+        
+        if ENCERRAMENTO_FILE.exists():
+            st.caption(f"Arquivo de encerramento: `{ENCERRAMENTO_FILE.name}`")
+        else:
+            st.warning("Arquivo 'ENCERRAMENTO PADRÃO.mp4' não encontrado na raiz.")
 
     with col_v2:
         st.markdown("### 3. Seleção de Áudio e Renderização")
@@ -295,23 +438,34 @@ with tab_video:
             idx_audio = st.selectbox("Selecione a Narração do Tema:", range(len(rotulos_audios)), format_func=lambda x: rotulos_audios[x], key="sel_audio_para_video")
             audio_escolhido = audios_disponiveis[idx_audio]
             
-            nome_sug_video = audio_escolhido.stem
-            nome_video_saida = st.text_input("Nome do Vídeo Final (sem extensão):", value=nome_sug_video, key="nome_video_saida")
+            # Sugestão de título H1 e nome de arquivo
+            titulo_h1_sugerido = audio_escolhido.stem
+            nome_sug_video = f"{sanitizar_nome_arquivo(audio_escolhido.stem)}_16x9"
+            
+            titulo_h1_input = st.text_input("Título H1 para o Card em Vídeo:", value=titulo_h1_sugerido, key="input_h1_text")
+            nome_video_saida = st.text_input("Nome do Arquivo de Saída:", value=nome_sug_video, key="nome_video_saida")
             
             st.audio(str(audio_escolhido))
             
-            btn_render_video = st.button("⚡ Renderizar Vídeo 16:9 (1 Clique)", type="primary", use_container_width=True, key="btn_render_v")
+            btn_render_video = st.button("⚡ Renderizar Vídeo 16:9 Completo (1 Clique)", type="primary", use_container_width=True, key="btn_render_v")
             
             if btn_render_video and cena_escolhida:
                 destino_video = VIDEOS_GERADOS_DIR / f"{sanitizar_nome_arquivo(nome_video_saida)}.mp4"
-                with st.spinner("Processando montagem do vídeo 16:9 com FFmpeg (1920x1080 + Loop + Logo)..."):
-                    sucesso = renderizar_video_tema(cena_escolhida, audio_escolhido, destino_video, LOGO_FILE)
+                with st.spinner("Compondo vídeo 16:9 com FFmpeg (Overlay H1 + Loop + Logo + Encerramento Padrão)..."):
+                    sucesso = renderizar_video_tema(
+                        caminho_video_base=cena_escolhida,
+                        caminho_audio=audio_escolhido,
+                        destino_mp4=destino_video,
+                        logo_path=LOGO_FILE,
+                        titulo_h1=titulo_h1_input if chk_h1 else "",
+                        incluir_encerramento=chk_encerramento
+                    )
                     if sucesso:
-                        st.success(f"Vídeo 16:9 renderizado com sucesso em {destino_video.name}!")
+                        st.success(f"Vídeo 16:9 renderizado com sucesso!")
                         st.video(str(destino_video))
                         st.caption(f"📁 Salvo em: `{destino_video.relative_to(BASE_DIR)}`")
                     else:
-                        st.error("Erro na renderização via FFmpeg.")
+                        st.error("Erro na renderização via FFmpeg. Verifique os arquivos selecionados.")
 
 # ------------------------------------------------------------------------------
 # ABA 3: BIBLIOTECA DE ARQUIVOS
