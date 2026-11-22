@@ -37,7 +37,16 @@ LOGO_FILE = BASE_DIR / "LOGO PARA USO.png"
 NARRATION_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_GERADOS_DIR.mkdir(parents=True, exist_ok=True)
 
-env_cfg = dotenv_values(BASE_DIR / ".env")
+# Suporte transparente a st.secrets (Streamlit Cloud) e .env (Local)
+env_cfg = {}
+try:
+    if hasattr(st, "secrets"):
+        for k, v in st.secrets.items():
+            env_cfg[k] = str(v)
+except Exception:
+    pass
+env_cfg.update(dotenv_values(BASE_DIR / ".env"))
+
 GRADIUM_KEY = env_cfg.get("GRADIUM_API_KEY", "")
 OPENROUTER_KEY = env_cfg.get("API_KEY_OPENROUTER", "")
 OPENROUTER_MODEL = env_cfg.get("MODEL_USE", "fish-audio/s2.1-pro-free:free")
