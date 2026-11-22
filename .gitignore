@@ -17,6 +17,8 @@ ENV/
 # Heavy Media & Generated Assets
 NARRAÇÕES/
 VIDEOS GERADOS/
+.temp/
+scratch*
 *.wav
 *.mp3
 *.ogg
