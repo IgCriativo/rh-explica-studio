@@ -1,9 +1,19 @@
 import os
+import sys
 import re
 import wave
 import asyncio
 import subprocess
 from pathlib import Path
+
+# Auto-bootstrap: se executado diretamente via 'python app_narrador.py', dispara o Streamlit automaticamente
+try:
+    import streamlit.runtime
+    if not streamlit.runtime.exists():
+        sys.exit(subprocess.call([sys.executable, "-m", "streamlit", "run", __file__] + sys.argv[1:]))
+except (ImportError, Exception):
+    pass
+
 import streamlit as st
 import requests
 from dotenv import dotenv_values
