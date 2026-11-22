@@ -1,0 +1,35 @@
+# Environment & Secrets (ZERO TRUST)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Heavy Media & Generated Assets
+NARRAÇÕES/
+VIDEOS GERADOS/
+*.wav
+*.mp3
+*.ogg
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+ehthumbs.db
+.vscode/
+.idea/
+
+desktop.ini
